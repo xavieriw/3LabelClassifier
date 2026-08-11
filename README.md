@@ -1,6 +1,6 @@
 
 <p align="center">
-<img src="images/AIHazardDetectionIcon.jpg?token=GHSAT0AAAAAADD4337YK2UCXTSJDEWAKN722BFILZQ" width=50% height=50%>
+<img src="images/AIHazardDetectionIcon.png?token=GHSAT0AAAAAADD4337YK2UCXTSJDEWAKN722BFILZQ" width=50% height=50%>
 </p>
 
 # Posts of Peril: Detecting Hazards in Text
