@@ -5,6 +5,7 @@
 
 # 3LabelClassifier: Prediction for Reddit Comment Sentiment
 This is a command line interface (CLI) tool that transforms text into embeddings via Qwen3-Embedding-0.6B and trains 4 classifiers (RF, SVC, XGB, NN) to identify text as AI / Not AI / Other.
+Based off of the code provided by Keith Burghardt https://github.com/KeithBurghardt/HazardPackage
 
 ## How to install
 Requirements: Python 3.12, pip (e.g., pip-25.1.1 works)
