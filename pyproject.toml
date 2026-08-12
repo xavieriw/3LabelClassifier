@@ -29,15 +29,18 @@ dependencies =[
     "matplotlib >= 3.10.3"]
 requires-python = ">= 3.12"
 authors = [
-  {name = "Keith Burghardt"}]
+  {name = "Keith Burghardt"},
+  {name = "Xavier Wilson"}
+  ]
 maintainers = [
-  {name = "Keith Burghardt"}
+  {name = "Keith Burghardt"},
+  {name = "Xavier Wilson"}
 ]
-description = "Detect hazards within social media text."
+description = "Classify social media comments as AI / Not AI / Other"
 readme = "README.md"
 license = "MIT"
 license-files = ["AUTHORS.md"]
-keywords = ["hazard", "nlp", "detection", "social media"]
+keywords = ["reddit", "nlp", "detection", "social media", "classifier"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
