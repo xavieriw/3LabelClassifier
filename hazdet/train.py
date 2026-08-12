@@ -5,11 +5,82 @@
 # !pip install scikit-learn
 # !pip install scikit-optimize
 
+import os
+import subprocess
+
+
+def _select_gpu(min_free_mb=4000, required_name_substring=None):
+    """
+    Automatically pick the least-loaded visible GPU by setting
+    CUDA_VISIBLE_DEVICES *before* torch/tensorflow/sentence-transformers
+    are imported below -- this has to run first, since GPU selection is
+    effectively locked in once those libraries initialize.
+
+    Useful on shared multi-GPU nodes where GPU 0 may already be full from
+    another user's/job's process, even though other GPUs on the same node
+    are free.
+
+    On nodes with a mixed GPU fleet (e.g. A100s alongside other
+    architectures), only GPUs whose name contains `required_name_substring`
+    are considered -- otherwise auto-selection can land on an incompatible
+    architecture (e.g. an H100) that this TensorFlow/PyTorch build wasn't
+    compiled for, causing cryptic runtime errors like
+    "Failed call to cudaGetFuncBySymbol: invalid device function" instead
+    of a clear one. Set required_name_substring=None to consider all GPUs
+    regardless of model.
+
+    If CUDA_VISIBLE_DEVICES is already set (e.g. by SLURM's --gres), only
+    those GPU indices are considered -- this respects whatever the
+    scheduler granted, while still picking the least-loaded one among them
+    if more than one was granted.
+    """
+    try:
+        existing = os.environ.get('CUDA_VISIBLE_DEVICES')
+        candidate_indices = None
+        if existing:
+            candidate_indices = [int(i) for i in existing.split(',') if i.strip() != '']
+
+        output = subprocess.check_output(
+            ['nvidia-smi', '--query-gpu=index,name,memory.free',
+             '--format=csv,noheader,nounits'],
+            encoding='utf-8'
+        )
+        gpus = []
+        for line in output.strip().split('\n'):
+            idx_str, name, free_str = [x.strip() for x in line.split(',')]
+            idx, free = int(idx_str), int(free_str)
+            if candidate_indices is not None and idx not in candidate_indices:
+                continue
+            if required_name_substring is not None and required_name_substring not in name:
+                continue
+            gpus.append((idx, name, free))
+
+        if not gpus:
+            print(f'WARNING: no visible GPU matched required_name_substring='
+                  f'{required_name_substring!r}. Leaving CUDA_VISIBLE_DEVICES '
+                  f'unchanged -- torch/tensorflow will use their own defaults.')
+            return
+
+        best_idx, best_name, best_free = max(gpus, key=lambda g: g[2])
+        if best_free < min_free_mb:
+            print(f'WARNING: no matching GPU has more than {min_free_mb} MiB free '
+                  f'(best is GPU {best_idx} [{best_name}] with {best_free} MiB free). '
+                  f'Proceeding anyway -- you may hit an out-of-memory error.')
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(best_idx)
+        print(f'[GPU auto-select] Using GPU {best_idx} [{best_name}] ({best_free} MiB free)')
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
+        # nvidia-smi not available/parsable (e.g. a CPU-only machine) --
+        # leave CUDA_VISIBLE_DEVICES as-is and let torch/tf fall back to CPU
+        pass
+
+
+_select_gpu()
 
 import pandas as pd
 import numpy as np
 import random
 import pickle as pk
+import warnings
 from scipy.stats import beta
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score,f1_score
@@ -17,19 +88,86 @@ from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 import skopt
 from skopt.space import Real, Integer,Categorical
-from skopt import BayesSearchCV
+from skopt import BayesSearchCV, gp_minimize
+from skopt.utils import use_named_args
 import demoji
 from sentence_transformers import SentenceTransformer
-import tensorflow as tf
-from tensorflow import keras
-from keras.callbacks import EarlyStopping
-from tensorflow.keras import regularizers
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout, BatchNormalization, LeakyReLU, Normalization
-from tensorflow.keras.optimizers import Adam
-from keras.metrics import AUC
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from xgboost import XGBClassifier
-import GPyOpt
+
+# sklearn's SVC(probability=True) -- used throughout this file to get
+# predict_proba() for the 3-class AI/Not AI/Other output -- is deprecated
+# as of sklearn 1.9 in favor of CalibratedClassifierCV(SVC(), ensemble=False),
+# and is slated for REMOVAL in sklearn 1.11. Silencing this specific warning
+# only hides the noise; it does not fix the upcoming break. When this
+# codebase upgrades past sklearn 1.11, every `SVC(probability=True)` call in
+# this file will need to be migrated to CalibratedClassifierCV instead.
+warnings.filterwarnings(
+    'ignore',
+    message=r".*`probability` parameter was deprecated.*",
+    category=FutureWarning,
+    module=r"sklearn\.svm\._base",
+)
+
+# The NN classifier is implemented in PyTorch rather than Keras/TensorFlow.
+# Official TensorFlow pip wheels don't ship pre-compiled CUDA kernels for
+# Hopper-architecture GPUs (compute capability sm_90 -- H100/H200), only a
+# generic PTX fallback that has to be JIT-compiled at runtime (slow, and
+# prone to errors like "Failed call to cudaGetFuncBySymbol: invalid device
+# function"). PyTorch's Hopper support is far more mature, and this file
+# already depends on it anyway via sentence-transformers, so standardizing
+# on one GPU backend avoids the issue entirely.
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Qwen/Qwen3-Embedding-0.6B produces 1024-dimensional embeddings
+# (see https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)
+EMBEDDING_MODEL = 'Qwen/Qwen3-Embedding-0.6B'
+EMBEDDING_DIM = 1024
+
+# The classifier predicts whether a Reddit comment indicates the linked
+# image/content is AI-generated, not AI-generated, or something else
+# (unclear/off-topic/etc). To make that judgment, it's given the full
+# context a human annotator would have had: the post title, the post's
+# own text (if any), and the comment body itself -- combined into a
+# single string and embedded as one vector (see _combine_context below).
+CLASS_COLUMNS = {'AI (Y/N)': 0, 'Not AI (Y/N)': 1, 'Other (Y/N)': 2}
+CLASS_LABELS = ['AI', 'Not AI', 'Other']
+
+
+def _parse_bool(val):
+    #Robustly interpret a cell as a boolean. Handles native Python bool
+    #(from .xlsx), and string forms like 'TRUE'/'False'/'Y'/'1' (from
+    #.csv/.tsv) -- note that a naive bool('False') is WRONG (any non-empty
+    #string is truthy in Python), so this must be handled explicitly.
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return False
+    s = str(val).strip().upper()
+    return s in ('TRUE', '1', 'YES', 'Y')
+
+
+def _combine_context(title, parent_text, comment_body):
+    #Combine a Reddit comment's post title, parent (submission) text, and
+    #the comment body itself into a single string for embedding -- giving
+    #the model the same context a human annotator would have had when
+    #judging whether the comment indicates AI, Not AI, or Other.
+    parts = []
+    for label, val in [('Title', title), ('Post text', parent_text), ('Comment', comment_body)]:
+        if val is not None and str(val).strip() and str(val).strip().lower() != 'nan':
+            parts.append(f'{label}: {val}')
+    return '\n\n'.join(parts)
+
+
+def to_class_labels(y):
+    #Convert a one-hot encoded (n, 3) label matrix into a single-column
+    #vector of integer class labels (0=AI, 1=Not AI, 2=Other).
+    #Used for the sklearn-style classifiers (RF, SVC, XGB), which expect
+    #integer class labels rather than one-hot vectors.
+    return np.argmax(y, axis=1)
+
 
 def extract_qualtrics_data(file='Tweet annotation.csv'):
     # make sure we only include annotators who completed full survey
@@ -145,22 +283,85 @@ def create_features(file='Tweet annotation.csv'):
             GT_labels['hazard'].append(haz)
             GT_labels['benefit'].append(ben)
         GT_labels = pd.DataFrame(GT_labels)
+    elif file.endswith('.xlsx') or file.endswith('.xls'):
+        GT_labels = pd.read_excel(file)
     else:
         GT_labels = pd.read_csv(file)
     #Sentences are encoded by calling model.encode()
-    model = SentenceTransformer('stsb-xlm-r-multilingual')#'all-mpnet-base-v2')
-    embeddings = model.encode(GT_labels['text'].values)
-    GT_labels['embeddings'] = [e for e in embeddings]
-    GT_labels.sample(frac=1,replace=False)# mix up the rows
-    gt_xy =GT_labels[['embeddings','hazard','benefit']].replace([None],np.nan).dropna()
-    X = np.array([v.astype('float32') for v in gt_xy['embeddings'].values])
-    y = gt_xy[['hazard','benefit']].values.round()
+    model = SentenceTransformer(EMBEDDING_MODEL)
+
+    # Accept either the friendly lowercase column names ('title',
+    # 'parent_text', 'comment_body') or the spreadsheet's exact headers
+    # ('Title', 'Parent Text', 'Comment Body', 'AI (Y/N)', ...) -- match
+    # case-insensitively so either format works without renaming columns.
+    col_map = {str(c).strip().lower(): c for c in GT_labels.columns}
+
+    def _find_col(*names):
+        for name in names:
+            if name.lower() in col_map:
+                return col_map[name.lower()]
+        return None
+
+    title_col = _find_col('title')
+    parent_col = _find_col('parent_text', 'parent text')
+    body_col = _find_col('comment_body', 'comment body')
+    if title_col is None or parent_col is None or body_col is None:
+        raise Exception(f'ERROR: {file} must contain "title", "parent_text", and '
+                         f'"comment_body" columns (or their spreadsheet-header '
+                         f'equivalents "Title", "Parent Text", "Comment Body").')
+
+    label_cols = {}
+    for label_name, idx in CLASS_COLUMNS.items():
+        c = _find_col(label_name)
+        if c is None:
+            raise Exception(f'ERROR: Could not find expected column "{label_name}" in {file}. '
+                             f'Expected columns: {list(CLASS_COLUMNS.keys())}.')
+        label_cols[idx] = c
+
+    # Build one training example per row: the combined title/post-text/
+    # comment-body context, labeled with whichever single one of
+    # AI/Not AI/Other was marked True for that row. Rows where zero or
+    # more than one of those three were marked True are skipped rather
+    # than guessed at.
+    texts = []
+    labels = []
+    skipped_ambiguous = 0
+    skipped_blank = 0
+    for _, row in GT_labels.iterrows():
+        combined = _combine_context(row.get(title_col), row.get(parent_col), row.get(body_col))
+        if not combined.strip():
+            skipped_blank += 1
+            continue
+
+        flags = [_parse_bool(row.get(label_cols[idx])) for idx in range(3)]
+        true_labels = [i for i, v in enumerate(flags) if v]
+        if len(true_labels) != 1:
+            skipped_ambiguous += 1
+            continue
+
+        texts.append(combined)
+        labels.append(true_labels[0])
+
+    if skipped_blank:
+        print(f'NOTE: skipped {skipped_blank} row(s) with no title/parent_text/comment_body content.')
+    if skipped_ambiguous:
+        print(f'NOTE: skipped {skipped_ambiguous} row(s) where AI/Not AI/Other '
+              f"weren't exactly one boolean set to True.")
+    print(f'Building features for {len(texts)} labeled rows.')
+
+    embeddings = model.encode(texts, show_progress_bar=True)
+    X = np.array([e.astype('float32') for e in embeddings])
+    # one-hot encode the 3 classes: AI / Not AI / Other
+    y = np.zeros((len(labels), 3), dtype='float32')
+    y[np.arange(len(labels)), labels] = 1
     return X,y
 
 def hyperparameter_tune_model(X,y,search_space,model):
     X_train, X_test, y_train, y_test = train_test_split(X, y,train_size=0.9, random_state=42)
-    y_train = y_train[:,0].round().reshape(-1,1)
-    y_test = y_test[:,0].round().reshape(-1,1)
+    # y is one-hot encoded for the 3 classes (title/parent_text/comment_body);
+    # sklearn-style classifiers expect a single column of integer class labels
+    y_train = to_class_labels(y_train)
+    y_test = to_class_labels(y_test)
     optimizer = BayesSearchCV(
     estimator=model,
     search_spaces=search_space,
@@ -175,204 +376,201 @@ def hyperparameter_tune_model(X,y,search_space,model):
     best_score = optimizer.best_score_
     return rf_best_hyperparameters,best_score
 
-def build_model(nx, layers, activations, lambtha, keep_prob):
+class _MLP(nn.Module):
+    """
+    A small feed-forward network, structurally equivalent to what the old
+    Keras build_model() produced for layers=[256, 256, 3]:
+        Dense(256, relu) applied directly to the input (no dropout before it)
+        -> Dropout -> Dense(256, relu)
+        -> Dropout -> Dense(3)  [raw logits -- no activation here]
 
-    #Function that builds a neural network with the Keras library
-    #Args:
-    #  nx is the number of input features to the network
-    #  layers is a list containing the number of nodes in each layer of the
-    #  network
-    #  activations is a list containing the activation functions used for
-    #  each layer of the network
-    #  lambtha is the L2 regularization parameter
-    #  keep_prob is the probability that a node will be kept for dropout
-    #Returns: the keras model
+    The final layer intentionally outputs raw logits rather than
+    softmax probabilities, since nn.CrossEntropyLoss applies
+    log-softmax internally (more numerically stable than the old
+    softmax-then-categorical_crossentropy approach). Callers that need
+    class probabilities should apply torch.softmax() to the output
+    (see TorchMLPClassifier.predict_proba below).
+    """
+    def __init__(self, nx, layers, keep_prob):
+        super().__init__()
+        dims = [nx] + list(layers)
+        self.first = nn.Linear(dims[0], dims[1])
+        self.rest = nn.ModuleList([nn.Linear(dims[i], dims[i + 1]) for i in range(1, len(dims) - 1)])
+        self.dropout = nn.Dropout(1 - float(keep_prob))
+        self.n_rest = len(self.rest)
 
-    inputs = keras.Input(shape=(nx,))
-    regularizer = regularizers.l2(float(lambtha))
-
-    output = Dense(layers[0],
-                            activation=activations[0],
-                            kernel_regularizer=regularizer)(inputs)
-
-    hidden_layers = range(len(layers))[1:]
-
-    for i in hidden_layers:
-        dropout = keras.layers.Dropout(1 - float(keep_prob))(output)
-        output = Dense(layers[i], activation=activations[i],
-                                kernel_regularizer=regularizer)(dropout)
-
-    model = keras.Model(inputs, output)
-
-    return model
-
-def optimize_model(network, alpha, beta1, beta2):
-
-    #Function that sets up Adam optimization for a keras model with categorical
-    #crossentropy loss and accuracy metrics
-    #Args:
-    #network is the model to optimize
-    #alpha is the learning rate
-    #beta1 is the first Adam optimization parameter
-    #beta2 is the second Adam optimization parameter
-    #Returns: None
-
-    adam = Adam(learning_rate=float(alpha),
-                             beta_1=float(beta1),
-                             beta_2=beta2)
-
-    network.compile(optimizer=adam,
-                    loss="categorical_crossentropy",
-                    metrics=['accuracy', AUC()])
-def train_model(network, train_data, labels, batch_size, epochs,
-                validation_data=None, early_stopping=False,
-                patience=0, learning_rate_decay=False,
-                alpha=0.1, decay_rate=1, filepath=None,
-                verbose=False, shuffle=False):
-
-    #Function That trains a model using mini-batch gradient descent
-    #Args:
-    #network is the model to train
-    #data is a numpy.ndarray of shape (m, nx) containing the input data
-    #labels is a one-hot numpy.ndarray of shape (m, classes) containing
-    #the labels of data
-    #batch_size is the size of the batch used for mini-batch gradient descent
-    #epochs is the number of passes through data for mini-batch gradient descent
-    #validation_data is the data to validate the model with, if not None
-
-    def learning_rate_decay(epoch):
-        #"""Function tha uses the learning rate"""
-        alpha_0 = alpha / (1 + (decay_rate * epoch))
-        return alpha_0
-
-    callbacks = []
-    if validation_data:
-        if early_stopping:
-            early_stop = EarlyStopping(patience=patience)
-            callbacks.append(early_stop)
-
-        if learning_rate_decay:
-            decay = keras.callbacks.LearningRateScheduler(learning_rate_decay,
-                                                      verbose=verbose)
-            callbacks.append(decay)
+    def forward(self, x):
+        x = F.relu(self.first(x))
+        for i, layer in enumerate(self.rest):
+            x = self.dropout(x)
+            x = layer(x)
+            if i < self.n_rest - 1:
+                x = F.relu(x)
+            # last layer: no activation -- raw logits for CrossEntropyLoss
+        return x
 
 
-    if filepath:
-        print(filepath)
-        save = keras.callbacks.ModelCheckpoint(filepath, save_best_only=True)
-        callbacks.append(save)
+class TorchMLPClassifier:
+    """
+    A thin sklearn-like wrapper around the PyTorch _MLP network above.
+    Exposes .fit()/.predict_proba()/.predict(), so it's a drop-in
+    replacement for the old Keras-based NN wherever this file calls it,
+    and -- unlike the old Keras model, which had to be saved separately
+    via .save() -- it can be pickled with pk.dump()/pk.load() exactly
+    like the RF/SVC/XGB classifiers elsewhere in this file, so
+    inference.py's loading code works identically for every model type.
+    """
+    def __init__(self, nx=None, layers=(256, 256, 3), lambtha=0.0, keep_prob=0.5, device=None):
+        self.nx = nx
+        self.layers = layers
+        self.lambtha = lambtha
+        self.keep_prob = keep_prob
+        self.device = device or DEVICE
+        self.model = None
+        self.history = {'loss': [], 'val_loss': []}
 
-    train = network.fit(x=train_data,
-                        y=labels,
-                        batch_size=int(batch_size),
-                        epochs=epochs,
-                        validation_data=validation_data,
-                        callbacks=callbacks,
-                        verbose=False,
-                        shuffle=shuffle)
-    return train
+    def _build(self, nx):
+        self.nx = nx
+        self.model = _MLP(nx, self.layers, self.keep_prob).to(self.device)
 
+    def fit(self, X_train, y_train, batch_size=32, epochs=100,
+            validation_data=None, alpha=0.001, beta1=0.9, beta2=0.999,
+            early_stopping=False, patience=0, learning_rate_decay=False,
+            decay_rate=1, verbose=False, shuffle=False):
+        #Trains the network using mini-batch gradient descent, mirroring
+        #the behavior of the old Keras train_model()/return_trained_model():
+        #  - y_train/y_val are one-hot (n, classes) arrays; converted to
+        #    integer class labels for nn.CrossEntropyLoss
+        #  - early_stopping: stop once val_loss hasn't improved for
+        #    `patience` consecutive epochs (matches Keras EarlyStopping's
+        #    default behavior: no restoring of best weights)
+        #  - learning_rate_decay: alpha_0 = alpha / (1 + decay_rate*epoch),
+        #    matching the original learning_rate_decay() schedule
+        #  - shuffle=False by default, matching the original calls (batches
+        #    are drawn in the given row order, not reshuffled each epoch)
 
-def return_trained_model(network, train_data, labels, batch_size, epochs,
-                validation_data=None, early_stopping=False,
-                patience=0, learning_rate_decay=False,
-                alpha=0.1, decay_rate=1, filepath=None,
-                verbose=False, shuffle=False):
-                                
-    #Function That trains a model using mini-batch gradient descent
-    #Args:
-    #network is the model to train
-    #data is a numpy.ndarray of shape (m, nx) containing the input data
-    #labels is a one-hot numpy.ndarray of shape (m, classes) containing
-    #the labels of data
-    #batch_size is the size of the batch used for mini-batch gradient descent
-    #epochs is the number of passes through data for mini-batch gradient descent
-    #validation_data is the data to validate the model with, if not None
-    
-    def learning_rate_decay(epoch):  
-        #"""Function tha uses the learning rate"""
-        alpha_0 = alpha / (1 + (decay_rate * epoch))
-        return alpha_0
-    
-    callbacks = []
-    if validation_data:
-        if early_stopping:
-            early_stop = EarlyStopping(patience=patience)
-            callbacks.append(early_stop)
-    
-        if learning_rate_decay:
-            decay = keras.callbacks.LearningRateScheduler(learning_rate_decay,
-                                                      verbose=verbose)
-            callbacks.append(decay)
-                
-                
-    if filepath:
-        print(filepath)
-        save = keras.callbacks.ModelCheckpoint(filepath, save_best_only=True)
-        callbacks.append(save)
-    
-    train = network.fit(x=train_data,
-                        y=labels,
-                        batch_size=int(batch_size),
-                        epochs=epochs,
-                        validation_data=validation_data,
-                        callbacks=callbacks,
-                        verbose=False,
-                        shuffle=shuffle)
-    return network
+        if self.model is None:
+            self._build(X_train.shape[1])
+
+        X_train_t = torch.tensor(np.asarray(X_train, dtype='float32'), device=self.device)
+        y_train_labels = torch.tensor(np.argmax(y_train, axis=1), dtype=torch.long, device=self.device)
+
+        if validation_data is not None:
+            X_val, y_val = validation_data
+            X_val_t = torch.tensor(np.asarray(X_val, dtype='float32'), device=self.device)
+            y_val_labels = torch.tensor(np.argmax(y_val, axis=1), dtype=torch.long, device=self.device)
+
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=float(alpha),
+                                      betas=(float(beta1), float(beta2)),
+                                      weight_decay=float(self.lambtha))
+        loss_fn = nn.CrossEntropyLoss()
+
+        n = X_train_t.shape[0]
+        batch_size = int(batch_size)
+        best_val_loss = np.inf
+        epochs_since_improvement = 0
+
+        for epoch in range(epochs):
+            if learning_rate_decay:
+                lr = alpha / (1 + decay_rate * epoch)
+                for g in optimizer.param_groups:
+                    g['lr'] = lr
+
+            self.model.train()
+            if shuffle:
+                perm = torch.randperm(n, device=self.device)
+                X_epoch, y_epoch = X_train_t[perm], y_train_labels[perm]
+            else:
+                X_epoch, y_epoch = X_train_t, y_train_labels
+
+            epoch_loss = 0.0
+            for start in range(0, n, batch_size):
+                end = start + batch_size
+                xb, yb = X_epoch[start:end], y_epoch[start:end]
+                optimizer.zero_grad()
+                logits = self.model(xb)
+                loss = loss_fn(logits, yb)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item() * xb.shape[0]
+            epoch_loss /= n
+            self.history['loss'].append(epoch_loss)
+
+            if validation_data is not None:
+                self.model.eval()
+                with torch.no_grad():
+                    val_logits = self.model(X_val_t)
+                    val_loss = loss_fn(val_logits, y_val_labels).item()
+                self.history['val_loss'].append(val_loss)
+
+                if early_stopping:
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        epochs_since_improvement = 0
+                    else:
+                        epochs_since_improvement += 1
+                        if epochs_since_improvement > patience:
+                            break
+
+        # Move to CPU once training is done, so pickling this object
+        # (via pk.dump in train_best_model) doesn't tie the saved model
+        # file to whichever GPU/CUDA setup happened to train it.
+        self.model.to('cpu')
+        self.device = torch.device('cpu')
+        return self
+
+    def predict_proba(self, X):
+        self.model.eval()
+        with torch.no_grad():
+            X_t = torch.tensor(np.asarray(X, dtype='float32'), device=self.device)
+            probs = torch.softmax(self.model(X_t), dim=1).cpu().numpy()
+        return probs
+
+    def predict(self, X):
+        # kept for parity with call sites that used the old Keras
+        # clf.predict(X) -- returns the same (n, 3) class probabilities
+        # as predict_proba
+        return self.predict_proba(X)
 
 
 def hyperparameter_tune_nn(X,y):
     X_train, X_test, y_train, y_test = train_test_split(X, y,train_size=0.9, random_state=42)
-    y_train = y_train[:,0].round().reshape(-1,1)
-    y_test = y_test[:,0].round().reshape(-1,1)
-    
-    data = [X_train,y_train]
-    # Setting the bounds of network parameter for the bayeyias optimizatio
-    bounds = [{'name': 'lambtha', 'type': 'continuous','domain': (0.00005, 0.005)},
-            {'name': 'keep_prob', 'type': 'continuous','domain': (0.05, 0.95)},
-            {'name': 'alpha', 'type': 'continuous','domain': (0.0001, 0.005)},
-            {'name': 'beta1', 'type': 'continuous', 'domain': (0.9, 0.999)},
-            {'name': 'batch_size', 'type': 'discrete', 'domain': (32, 128)}]
+    # y is already one-hot encoded for the 3 classes (title/parent_text/comment_body);
+    # the NN uses the full one-hot target with categorical_crossentropy + softmax
 
-    # Creating the GPyOpt method using Bayesian Optimizatio
-    def object_function(x):
-        #Function that set hyperparameters of a keras network:
-        #Args: paramsData is a vector conating the parameter to optimized and trained
-        #    lambtha is the L2 regularization parameter
+    # Setting the bounds of network parameters for Bayesian optimization
+    # (mirrors the bounds previously passed to GPyOpt)
+    search_space = [
+        Real(0.00005, 0.005, name='lambtha'),
+        Real(0.05, 0.95, name='keep_prob'),
+        Real(0.0001, 0.005, name='alpha'),
+        Real(0.9, 0.999, name='beta1'),
+        Categorical([32, 128], name='batch_size'),
+    ]
+
+    # Creating the objective function for skopt's Bayesian optimization.
+    # @use_named_args unpacks each proposed point in search_space into
+    # named keyword arguments, so object_function receives plain scalar
+    # values (unlike GPyOpt, which passed a batched 2D array).
+    @use_named_args(search_space)
+    def object_function(lambtha, keep_prob, alpha, beta1, batch_size):
+        #Function that sets hyperparameters of the PyTorch network, trains it,
+        #and returns the loss to be minimized:
+        #    lambtha is the L2 regularization parameter (Adam weight_decay)
         #    keep_prob is the probability that a node will be kept for dropout
         #    alpha is the learning rate in Adam optimizer
         #    beta1 is the first Adam optimization parameter
         #    batch_size is the size of the batch used for mini-batch  gradient
         #    descent
-        #    data are the training and validation data (including ground truth labels)
 
-        #Returns the loss of the model
+        #Returns the validation loss of the model
 
-        def one_hot(Y, classes):
-          #"""convert an array to a one-hot matrix"""
-          m = Y.shape[0]
-          one_hot = np.zeros((classes, m))
-          one_hot[Y, np.arange(m)] = 1
-          return one_hot.T
+        # 3 output units (raw logits, softmax applied at predict time) for
+        # the 3 classes: title / parent_text / comment_body
+        clf = TorchMLPClassifier(nx=EMBEDDING_DIM, layers=(256, 256, 3),
+                                  lambtha=lambtha, keep_prob=keep_prob)
 
-        # x is 5 dimentional vector with the parameter we want to optimize
-        lambtha = x[:, 0]
-        keep_prob = x[:, 1]
-        alpha = x[:, 2]
-        beta1 = x[:, 3]
-        batch_size = x[:, 4]
-
-        # lambtha, keep_prob, alpha, beta1, batch_size
-        # Building the model using Keras library
-        network = build_model(768, [256, 256, 1], ['relu', 'relu', 'softmax'],lambtha, keep_prob)
-
-        # Optimizing the model using adam optimizer
-        beta2 = 0.999
-        optimize_model(network, alpha, beta1, beta2)
-
-        # Training the model using early stopping and saving the best modle
-        # in bayes_opt.txt'
+        # Training the model using early stopping
         epochs = 100
         random_indices = list(range(len(X_train)))
         random.shuffle(random_indices)
@@ -382,26 +580,23 @@ def hyperparameter_tune_nn(X,y):
         Y_train_i = y_train[train_ind]
         X_valid = X_train[valid_ind]
         Y_valid = y_train[valid_ind]
-        history = train_model(network, X_train_i, Y_train_i, batch_size, epochs,
-                              validation_data=(X_valid, Y_valid),
-                              early_stopping=True, patience=3,
-                              learning_rate_decay=True)
-        return (history.history['val_loss'][-1])
+        clf.fit(X_train_i, Y_train_i, batch_size=batch_size, epochs=epochs,
+                validation_data=(X_valid, Y_valid), alpha=alpha, beta1=beta1,
+                early_stopping=True, patience=3, learning_rate_decay=True)
+        return clf.history['val_loss'][-1]
 
-    my_Bayes_opt = GPyOpt.methods.BayesianOptimization(object_function,
-                                                   domain=bounds)
-
-    #Stop conditions
-    max_time  = None
-    max_iter  = 30
-    tolerance = 1e-8
+    #Stop conditions (mirrors the previous GPyOpt run: 30 iterations)
+    max_iter = 30
 
     #Running the method
-    my_Bayes_opt.run_optimization(max_iter = max_iter,
-                              max_time = max_time,
-                              eps = tolerance)
+    result = gp_minimize(
+        object_function,
+        search_space,
+        n_calls=max_iter,
+        random_state=42,
+    )
 
-    nn_hyperparameters = [(c,v) for c,v in zip(['lambtha','keep_prob','alpha','beta1','batch_size'],my_Bayes_opt.x_opt)]
+    nn_hyperparameters = [(c,v) for c,v in zip(['lambtha','keep_prob','alpha','beta1','batch_size'],result.x)]
     return nn_hyperparameters
 
 def hyperparameter_tune_all_models(file):
@@ -439,25 +634,30 @@ def hyperparameter_tune_all_models(file):
     'reg_lambda':Real(0.0,10.0),
     'importance_type':Categorical(['gain','weight','cover','total_gain','total_cover'])
     }
-    xgb_best_hyperparameters,_ = hyperparameter_tune_model(X,y,search_space,XGBClassifier())
+    # device='cpu' is explicit and required here: recent xgboost (2.x+) wheels
+    # bundle GPU support by default and will try to initialize CUDA even when
+    # GPU acceleration isn't requested, which can fail with
+    # "cudaErrorInsufficientDriver" if xgboost's bundled CUDA runtime
+    # dependencies (its own nvidia-*-cuXX pip packages) target a newer CUDA
+    # version than the node's actual NVIDIA driver supports. RF/SVC/XGB are
+    # CPU-only by design in this pipeline anyway -- only the embedding step
+    # and the NN training are meant to use the GPU -- so this just makes
+    # that explicit instead of relying on xgboost's own auto-detection.
+    xgb_best_hyperparameters,_ = hyperparameter_tune_model(X,y,search_space,XGBClassifier(device='cpu'))
     nn_best_hyperparameters = [v[1] for v in hyperparameter_tune_nn(X,y)]
     params = [rf_best_hyperparameters,svc_best_hyperparameters,xgb_best_hyperparameters,nn_best_hyperparameters]
     # save the best model...
     train_best_model(X,y,params)
 
 
-def train_nn(nn_best_hyperparameters,X_train, y_train,embedding_dim=768):
-    embedding_normalizer = Normalization(input_shape=[embedding_dim,], axis=None)
-    embedding_normalizer.adapt(X_train)
+def train_nn(nn_best_hyperparameters,X_train, y_train,embedding_dim=EMBEDDING_DIM):
     lambtha, keep_prob, alpha, beta1, batch_size = nn_best_hyperparameters
-    # Building the model using Keras library
     print(nn_best_hyperparameters)
-    print(lambtha)                         
-    # Optimizing the model using adam optimizer
-    beta2 = 0.999
-    network = build_model(768, [256, 256, 1], ['relu', 'relu', 'softmax'],lambtha, keep_prob)
-    optimize_model(network, alpha, beta1, beta2)
-    
+    print(lambtha)
+    # 3 output units (raw logits) for the 3 classes: title / parent_text / comment_body
+    clf = TorchMLPClassifier(nx=embedding_dim, layers=(256, 256, 3),
+                              lambtha=lambtha, keep_prob=keep_prob)
+
     # Training the model using early stopping and saving the best model
     epochs = 100
     random_indices = list(range(len(X_train)))
@@ -468,44 +668,51 @@ def train_nn(nn_best_hyperparameters,X_train, y_train,embedding_dim=768):
     Y_train_i = y_train[train_ind]
     X_valid = X_train[valid_ind]
     Y_valid = y_train[valid_ind]
-    m = return_trained_model(network, X_train_i, Y_train_i, batch_size, epochs,
-                              validation_data=(X_valid, Y_valid),
-                              early_stopping=True, patience=3,
-                              learning_rate_decay=True)
-    return m
+    clf.fit(X_train_i, Y_train_i, batch_size=batch_size, epochs=epochs,
+            validation_data=(X_valid, Y_valid), alpha=alpha, beta1=beta1,
+            early_stopping=True, patience=3, learning_rate_decay=True)
+    return clf
 
 def predict_model (model,model_params,X,y,ii):
     random_state = 999
     X_train, X_test, y_train, y_test = train_test_split(X, y,train_size=0.9, random_state=random_state)
-    y_train = y_train[:,0].round().reshape(-1,1)
-    y_test = y_test[:,0].round().reshape(-1,1)
+    # y is one-hot encoded for the 3 classes (title/parent_text/comment_body).
+    # The NN consumes the full one-hot target; the sklearn-style classifiers
+    # (RF/SVC/XGB) expect a single column of integer class labels.
+
     # random seed
     np.random.seed(ii*314159)
     boot_indices = np.random.randint(0,len(X_test),len(X_test))
 
     X_boot = X_test[boot_indices]
-    y_boot = y_test[boot_indices]    
+    y_boot = y_test[boot_indices]
     if model == 'NN':
         clf = train_nn(model_params,X_train, y_train)
-        y_pred = clf.predict(X_boot)
+        y_pred = clf.predict(X_boot)  # shape (n, 3) softmax probabilities
     elif model == 'RF':
+        y_train_labels = to_class_labels(y_train)
         kwargs = {key:value for key,value in model_params.items()}
         clf = RandomForestClassifier(**kwargs)
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict_proba(X_boot)[:,1]
+        clf.fit(X_train, y_train_labels)
+        y_pred = clf.predict_proba(X_boot)  # shape (n, 3)
 
     elif model == 'SVC':
+        y_train_labels = to_class_labels(y_train)
         kwargs = {key:value for key,value in model_params.items()}
         kwargs['probability'] = True
         clf = SVC(**kwargs)
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict_proba(X_boot)[:,1]
+        clf.fit(X_train, y_train_labels)
+        y_pred = clf.predict_proba(X_boot)  # shape (n, 3)
     elif model == 'XGB':
+        y_train_labels = to_class_labels(y_train)
         kwargs = {key:value for key,value in model_params.items()}
+        kwargs.setdefault('device', 'cpu')  # see note in hyperparameter_tune_all_models
         clf = XGBClassifier(**kwargs)
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict_proba(X_boot)[:,1]
-    return y_pred,y_boot
+        clf.fit(X_train, y_train_labels)
+        y_pred = clf.predict_proba(X_boot)  # shape (n, 3)
+    # return integer class labels for y_boot so the caller can score
+    # multiclass predictions consistently across all model types
+    return y_pred,to_class_labels(y_boot)
 
 
 def eval_best_model(X,y,params,num_evals = 50,eval_metric='roc_auc'):
@@ -522,12 +729,31 @@ def eval_best_model(X,y,params,num_evals = 50,eval_metric='roc_auc'):
         for ii in range(num_evals):
             y_pred,y_boot = predict_model (model,model_params[model],X,y,ii) 
             if eval_metric ==  'roc_auc':
-                performance = roc_auc_score(y_boot, y_pred)
+                # y_pred is (n, 3) class probabilities, y_boot is (n,) integer class labels.
+                # On small datasets, a given bootstrap draw can occasionally miss one of
+                # the 3 classes entirely (e.g. no "Not AI" examples in that draw) --
+                # roc_auc_score's multiclass mode requires every class present in y_pred's
+                # columns to also appear in y_boot, so it raises ValueError in that case.
+                # Rather than crashing the whole evaluation run over one unlucky draw,
+                # skip that draw and continue; this becomes vanishingly rare as dataset
+                # size grows, but is worth guarding against regardless.
+                try:
+                    performance = roc_auc_score(y_boot, y_pred, multi_class='ovr')
+                except ValueError as e:
+                    print(f'WARNING: skipping a bootstrap evaluation for {model} '
+                          f'(eval {ii}) -- {e}')
+                    continue
             elif eval_metric == 'f1':
-                performance = f1_score(y_boot,y_pred.round())
+                performance = f1_score(y_boot, np.argmax(y_pred, axis=1), average='macro')
             else:
                 raise Exception('ERROR: Evaluation metric not recognized.')
             performance_metric_boot.append(performance)
+        if not performance_metric_boot:
+            print(f'WARNING: every bootstrap evaluation for {model} was skipped '
+                  f'(dataset likely too small for reliable evaluation). Treating '
+                  f'its performance as 0.')
+            model_performance[model] = [0.0, 0.0]
+            continue
         mean_performance = np.mean(performance_metric_boot)
         std_performance = np.std(performance_metric_boot)
         model_performance[model] = [mean_performance,std_performance]
@@ -540,7 +766,8 @@ def eval_best_model(X,y,params,num_evals = 50,eval_metric='roc_auc'):
 def train_best_model(X,y,params):
     rf_best_hyperparameters,svc_best_hyperparameters,xgb_best_hyperparameters,nn_best_hyperparameters = params
     model_params = {'RF':rf_best_hyperparameters,'SVC':svc_best_hyperparameters,'XGB':xgb_best_hyperparameters,'NN':nn_best_hyperparameters}
-    y = y[:,0].round().reshape(-1,1)
+    # y stays one-hot encoded for the 3 classes (title/parent_text/comment_body);
+    # each model branch below converts it to the format it needs.
     # find the best model
     best_model,performance = eval_best_model(X,y,params,num_evals = 50,eval_metric='roc_auc')
     print(performance)
@@ -548,27 +775,30 @@ def train_best_model(X,y,params):
     pk.dump(performance, open(filename, 'wb'))
     if best_model == 'NN':
         clf = train_nn(model_params[best_model],X, y)
-        y_pred = clf.predict(X_boot)
-            
+
     elif best_model == 'RF':
+        y_labels = to_class_labels(y)
         kwargs = {key:value for key,value in model_params[best_model].items()}
         clf = RandomForestClassifier(**kwargs)
-        clf.fit(X, y)
+        clf.fit(X, y_labels)
     
     elif best_model == 'SVC':
+        y_labels = to_class_labels(y)
         kwargs = {key:value for key,value in model_params[best_model].items()}
         kwargs['probability'] = True
         clf = SVC(**kwargs)
-        clf.fit(X, y)
+        clf.fit(X, y_labels)
     elif best_model == 'XGB':
+        y_labels = to_class_labels(y)
         kwargs = {key:value for key,value in model_params[best_model].items()}
+        kwargs.setdefault('device', 'cpu')  # see note in hyperparameter_tune_all_models
         clf = XGBClassifier(**kwargs)
-        clf.fit(X, y)
-    if best_model == 'NN':
-        clf.save('finalized_model_NN.sav')
-        return
+        clf.fit(X, y_labels)
 
-    # otherwise...
+    # All 4 model types (including NN, now that it's a picklable
+    # TorchMLPClassifier rather than a Keras model) are saved the same way,
+    # so inference.py's pk.load()-based loading works identically regardless
+    # of which model type ended up being the best.
     filename = 'finalized_model_'+best_model+'.sav'
     pk.dump(clf, open(filename, 'wb'))
     return
