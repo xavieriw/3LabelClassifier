@@ -3,8 +3,8 @@
 <img src="images/AIHazardDetectionIcon.png?token=GHSAT0AAAAAADD4337YK2UCXTSJDEWAKN722BFILZQ" width=50% height=50%>
 </p>
 
-# Posts of Peril: Detecting Hazards in Text
-This is a command line interface (CLI) that determines hazard confidence of social media posts.
+# 3LabelClassifier: Prediction for Reddit Comment Sentiment
+This is a command line interface (CLI) tool that transforms text into embeddings via Qwen3-Embedding-0.6B and trains 4 classifiers (RF, SVC, XGB, NN) to identify text as AI / Not AI / Other.
 
 ## How to install
 Requirements: Python 3.12, pip (e.g., pip-25.1.1 works)
