@@ -1,3 +1,3 @@
 ## Example code
-- quickstart_inference.py: find hazazard confidence for an example dataset located in text.csv
-- quickstart_train.py: train your model and save both the best model and save the performance (ROC-AUC) of each model
+- quickstart_inference.py: find AI / Not AI / Other confidence for an example dataset located in text.csv
+- quickstart_train.py: Trains your model. The best model is saved to `finalized_model_<ModelName>.sav` alongside performance `finalized_performance.sav` (ROC-AUC) of each model
