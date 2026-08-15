@@ -43,21 +43,4 @@ See the [documentation](docs/documentation.md) for more details about how to pre
 ## How to train your own model
 We offer raw data, and data collection code in `ground_truth_data/`. 
 
-## Citation
-Please cite our work!
-```
-@inproceedings{AnonymousHazards2025,
-Title={Posts of Peril: Detecting Hazards in Text},
-Authors={Anonymized for review},
-Year={2025},
-Booktitle={Under review},
-Pages={11}
-}
-```
-Or
-```
-Anonymized. (2025). Posts of Peril: Detecting Hazards in Text. Under review.
-```
-
-
 
